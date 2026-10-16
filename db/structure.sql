@@ -11725,9 +11725,1844 @@ ALTER TABLE ONLY public.announcements
 -- PostgreSQL database dump complete
 --
 
+--
+-- Name: survey_check_absence_context(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_check_absence_context() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE event_id bigint;
+BEGIN
+  event_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.survey_event_id ELSE NEW.survey_event_id END;
+  IF EXISTS (SELECT FROM survey_event_targets WHERE survey_event_id = event_id AND absence_reporting IS TRUE)
+    AND NOT survey_has_positive_effort(event_id) THEN
+    RAISE EXCEPTION 'Absence reporting requires positive sampling effort';
+  END IF;
+  IF EXISTS (SELECT FROM survey_detections d JOIN survey_event_targets t ON t.id = d.survey_event_target_id
+    WHERE d.survey_event_id = event_id AND d.occurrence_status = 'absent'
+      AND (t.status <> 'surveyed' OR t.coverage_complete IS NOT TRUE OR t.absence_reporting IS NOT TRUE)) THEN
+    RAISE EXCEPTION 'Existing non-detections require complete absence-enabled targets';
+  END IF;
+  RETURN NULL;
+END $$;
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: survey_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_events (
+    id bigint NOT NULL,
+    uuid uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    survey_protocol_version_id bigint NOT NULL,
+    survey_site_id bigint,
+    survey_sampling_unit_id bigint,
+    trip_id integer,
+    parent_survey_event_id bigint,
+    user_id integer NOT NULL,
+    started_at timestamp without time zone,
+    ended_at timestamp without time zone,
+    time_zone character varying,
+    geom public.geometry(Geometry,4326),
+    location_privacy character varying DEFAULT 'private'::character varying NOT NULL,
+    status character varying DEFAULT 'planned'::character varying NOT NULL,
+    completion_status character varying DEFAULT 'unknown'::character varying NOT NULL,
+    remarks text,
+    completed_at timestamp without time zone,
+    voided_at timestamp without time zone,
+    void_reason text,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_event_lifecycle CHECK (((((status)::text <> 'completed'::text) OR ((completed_at IS NOT NULL) AND (started_at IS NOT NULL))) AND ((completed_at IS NULL) OR ((status)::text = ANY ((ARRAY['completed'::character varying, 'void'::character varying])::text[]))) AND (((status)::text <> 'void'::text) OR ((voided_at IS NOT NULL) AND (NULLIF(btrim(void_reason), ''::text) IS NOT NULL))))),
+    CONSTRAINT survey_event_privacy CHECK (((location_privacy)::text = ANY ((ARRAY['public'::character varying, 'restricted'::character varying, 'private'::character varying])::text[]))),
+    CONSTRAINT survey_event_status CHECK ((((status)::text = ANY ((ARRAY['planned'::character varying, 'in_progress'::character varying, 'completed'::character varying, 'void'::character varying])::text[])) AND ((completion_status)::text = ANY ((ARRAY['complete'::character varying, 'incomplete'::character varying, 'unknown'::character varying])::text[])))),
+    CONSTRAINT survey_event_times CHECK (((ended_at IS NULL) OR ((started_at IS NOT NULL) AND (ended_at >= started_at)))),
+    CONSTRAINT survey_event_unit_requires_site CHECK (((survey_sampling_unit_id IS NULL) OR (survey_site_id IS NOT NULL))),
+    CONSTRAINT survey_events_geometry CHECK (((geom IS NULL) OR ((public.st_srid(geom) = 4326) AND public.st_isvalid(geom) AND (NOT public.st_isempty(geom)) AND (public.geometrytype(geom) = ANY (ARRAY['POINT'::text, 'LINESTRING'::text, 'POLYGON'::text, 'MULTIPOINT'::text, 'MULTILINESTRING'::text, 'MULTIPOLYGON'::text])) AND (public.st_xmin(public.box3d(geom)) >= ('-180'::integer)::double precision) AND (public.st_xmax(public.box3d(geom)) <= (180)::double precision) AND (public.st_ymin(public.box3d(geom)) >= ('-90'::integer)::double precision) AND (public.st_ymax(public.box3d(geom)) <= (90)::double precision))))
+);
+
+--
+-- Name: survey_completion_errors(public.survey_events); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_completion_errors(e public.survey_events) RETURNS text[]
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE problems text[] := ARRAY[]::text[]; config jsonb; field text;
+BEGIN
+  SELECT definition INTO config FROM survey_protocol_versions WHERE id = e.survey_protocol_version_id;
+  IF e.started_at IS NULL THEN problems := array_append(problems, 'A start time is required'); END IF;
+  IF EXISTS (SELECT FROM survey_targets t WHERE t.survey_protocol_version_id = e.survey_protocol_version_id
+    AND NOT EXISTS (SELECT FROM survey_event_targets et WHERE et.survey_event_id = e.id AND et.survey_target_id = t.id)) THEN
+    problems := array_append(problems, 'Every protocol target must be materialized');
+  END IF;
+  IF EXISTS (SELECT FROM survey_event_targets et JOIN survey_targets t ON t.id = et.survey_target_id
+    WHERE et.survey_event_id = e.id AND t.required AND NOT (
+      et.status = 'surveyed' OR
+      (et.status = 'skipped' AND COALESCE((config->>'allow_skipped_targets')::boolean, false)) OR
+      (et.status = 'not_applicable' AND COALESCE((config->>'allow_not_applicable_targets')::boolean, false)))) THEN
+    problems := array_append(problems, 'Required targets must be assessed or explicitly permitted exceptions');
+  END IF;
+  IF COALESCE((config->>'require_effort')::boolean, true) AND
+    NOT EXISTS (SELECT FROM survey_efforts WHERE survey_event_id = e.id) THEN
+    problems := array_append(problems, 'Sampling effort is required');
+  END IF;
+  FOR field IN SELECT jsonb_array_elements_text(COALESCE(config->'required_effort_fields', '[]')) LOOP
+    IF NOT EXISTS (SELECT FROM survey_efforts WHERE survey_event_id = e.id) OR EXISTS (
+      SELECT FROM survey_efforts f WHERE f.survey_event_id = e.id AND (to_jsonb(f)->>field) IS NULL) THEN
+      problems := array_append(problems, 'Effort requires ' || field);
+    END IF;
+  END LOOP;
+  IF EXISTS (SELECT FROM survey_measurement_definitions d
+    WHERE d.survey_protocol_version_id = e.survey_protocol_version_id AND d.required AND d.applies_to = 'event'
+      AND NOT EXISTS (SELECT FROM survey_measurements m WHERE m.survey_event_id = e.id
+        AND m.survey_measurement_definition_id = d.id AND m.survey_detection_id IS NULL)) THEN
+    problems := array_append(problems, 'Required event measurements are missing');
+  END IF;
+  IF EXISTS (SELECT FROM survey_detections detection CROSS JOIN survey_measurement_definitions d
+    WHERE detection.survey_event_id = e.id AND d.survey_protocol_version_id = e.survey_protocol_version_id
+      AND d.required AND d.applies_to = 'detection' AND NOT EXISTS (
+        SELECT FROM survey_measurements m WHERE m.survey_detection_id = detection.id
+          AND m.survey_measurement_definition_id = d.id AND m.survey_event_id = e.id)) THEN
+    problems := array_append(problems, 'Required detection measurements are missing');
+  END IF;
+  IF EXISTS (SELECT FROM survey_event_targets WHERE survey_event_id = e.id AND absence_reporting IS TRUE)
+    AND NOT survey_has_positive_effort(e.id) THEN
+    problems := array_append(problems, 'Absence reporting requires positive effort');
+  END IF;
+  RETURN problems;
+END $$;
+
+--
+-- Name: survey_enforce_event_completion(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_enforce_event_completion() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE problems text[]; config jsonb;
+BEGIN
+  IF NEW.started_at IS DISTINCT FROM OLD.started_at OR NEW.ended_at IS DISTINCT FROM OLD.ended_at OR
+     (NEW.status = 'completed' AND OLD.status <> 'completed') THEN
+    SELECT definition INTO config FROM survey_protocol_versions WHERE id = NEW.survey_protocol_version_id;
+    IF NOT COALESCE((config->>'allow_effort_outside_event')::boolean, false) AND EXISTS (
+      SELECT FROM survey_efforts f WHERE f.survey_event_id = NEW.id AND
+        (f.started_at < NEW.started_at OR f.ended_at > NEW.ended_at OR
+         f.started_at > NEW.ended_at OR f.ended_at < NEW.started_at)) THEN
+      RAISE EXCEPTION 'Event timing must contain existing effort';
+    END IF;
+  END IF;
+  IF NEW.status = 'completed' AND OLD.status <> 'completed' THEN
+    problems := survey_completion_errors(NEW);
+    IF cardinality(problems) > 0 THEN RAISE EXCEPTION 'Cannot complete survey: %', array_to_string(problems, '; '); END IF;
+    -- Serialize completion with edits to the reusable sampling geometry.
+    IF NEW.survey_sampling_unit_id IS NOT NULL THEN
+      UPDATE survey_sampling_units SET updated_at = clock_timestamp() WHERE id = NEW.survey_sampling_unit_id;
+    END IF;
+    NEW.completed_at := clock_timestamp();
+  END IF;
+  IF NEW.status = 'void' AND OLD.status <> 'void' THEN NEW.voided_at := clock_timestamp(); END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_freeze_used_unit(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_freeze_used_unit() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF ROW(NEW.geom,NEW.area_square_meters,NEW.length_meters,NEW.survey_site_id,
+         NEW.parent_survey_sampling_unit_id,NEW.code,NEW.unit_type) IS DISTINCT FROM
+     ROW(OLD.geom,OLD.area_square_meters,OLD.length_meters,OLD.survey_site_id,
+         OLD.parent_survey_sampling_unit_id,OLD.code,OLD.unit_type) AND EXISTS (
+       SELECT FROM survey_events WHERE survey_sampling_unit_id = OLD.id AND completed_at IS NOT NULL) THEN
+    RAISE EXCEPTION 'Used sampling geometry and identity are frozen; create a replacement unit';
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_detection(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_detection() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.uuid <> OLD.uuid THEN RAISE EXCEPTION 'Detection ingestion UUID is stable'; END IF;
+  IF NEW.occurrence_status = 'absent' THEN
+    IF NOT EXISTS (SELECT FROM survey_event_targets WHERE id = NEW.survey_event_target_id
+      AND survey_event_id = NEW.survey_event_id AND status = 'surveyed'
+      AND coverage_complete IS TRUE AND absence_reporting IS TRUE) OR
+      NOT survey_has_positive_effort(NEW.survey_event_id) THEN
+      RAISE EXCEPTION 'Non-detection requires an assessed target, complete coverage and positive effort';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_effort(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_effort() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE e survey_events; config jsonb;
+BEGIN
+  SELECT * INTO e FROM survey_events WHERE id = NEW.survey_event_id;
+  SELECT definition INTO config FROM survey_protocol_versions WHERE id = e.survey_protocol_version_id;
+  IF config ? 'allowed_methods' AND NOT (config->'allowed_methods' ? NEW.method) THEN
+    RAISE EXCEPTION 'Effort method is not allowed by the protocol';
+  END IF;
+  IF NOT COALESCE((config->>'allow_effort_outside_event')::boolean, false) AND
+     (NEW.started_at < e.started_at OR NEW.ended_at > e.ended_at OR
+      NEW.started_at > e.ended_at OR NEW.ended_at < e.started_at) THEN
+    RAISE EXCEPTION 'Effort must fall within event timing';
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_event(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_event() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE version_status text;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.status IN ('completed','void') OR OLD.completed_at IS NOT NULL THEN
+      RAISE EXCEPTION 'Void historical surveys instead of deleting them';
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status NOT IN ('planned','in_progress') OR NEW.completed_at IS NOT NULL OR NEW.voided_at IS NOT NULL THEN
+      RAISE EXCEPTION 'Create an event before completing or voiding it';
+    END IF;
+  ELSE
+    IF NEW.uuid <> OLD.uuid OR NEW.survey_protocol_version_id <> OLD.survey_protocol_version_id THEN
+      RAISE EXCEPTION 'Event identity and protocol version are permanent';
+    END IF;
+    IF OLD.status IN ('completed','void') THEN
+      IF (to_jsonb(NEW) - ARRAY['trip_id','status','voided_at','void_reason','updated_at']) IS DISTINCT FROM
+         (to_jsonb(OLD) - ARRAY['trip_id','status','voided_at','void_reason','updated_at']) OR
+         (NEW.trip_id IS DISTINCT FROM OLD.trip_id AND NEW.trip_id IS NOT NULL) OR
+         NOT (NEW.status = OLD.status OR (OLD.status = 'completed' AND NEW.status = 'void')) OR
+         (OLD.status = 'void' AND ROW(NEW.voided_at,NEW.void_reason) IS DISTINCT FROM ROW(OLD.voided_at,OLD.void_reason)) THEN
+        RAISE EXCEPTION 'Completed scientific records are immutable; void and replace to correct';
+      END IF;
+    END IF;
+    IF NEW.completed_at IS DISTINCT FROM OLD.completed_at AND NOT
+       (OLD.completed_at IS NULL AND NEW.status = 'completed') THEN
+      RAISE EXCEPTION 'Completion provenance is immutable';
+    END IF;
+    IF NEW.status <> 'void' AND (NEW.voided_at IS NOT NULL OR NEW.void_reason IS NOT NULL) THEN
+      RAISE EXCEPTION 'Voiding metadata requires void status';
+    END IF;
+    IF OLD.status = 'in_progress' AND NEW.status = 'planned' THEN
+      RAISE EXCEPTION 'An active survey cannot return to planned';
+    END IF;
+  END IF;
+  IF TG_OP = 'INSERT' OR (NEW.status IS DISTINCT FROM OLD.status AND NEW.status IN ('in_progress','completed')) THEN
+    SELECT status INTO version_status FROM survey_protocol_versions
+      WHERE id = NEW.survey_protocol_version_id FOR SHARE;
+    IF version_status IS DISTINCT FROM 'published' THEN
+      RAISE EXCEPTION 'Only published protocols may initialize, activate or complete events';
+    END IF;
+  END IF;
+  IF NEW.trip_id IS NOT NULL THEN
+    PERFORM 1 FROM posts WHERE id = NEW.trip_id AND type = 'Trip' FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Survey trip must reference a Trip'; END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_event_child(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_event_child() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE event_id bigint;
+BEGIN
+  event_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.survey_event_id ELSE NEW.survey_event_id END;
+  IF TG_OP = 'UPDATE' AND NEW.survey_event_id <> OLD.survey_event_id THEN
+    RAISE EXCEPTION 'Scientific records cannot be moved between events';
+  END IF;
+  UPDATE survey_events SET updated_at = clock_timestamp()
+    WHERE id = event_id AND status NOT IN ('completed','void');
+  IF NOT FOUND THEN RAISE EXCEPTION 'Completed or void survey data is immutable'; END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_event_hierarchy(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_event_hierarchy() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' OR NEW.parent_survey_event_id IS DISTINCT FROM OLD.parent_survey_event_id THEN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'Survey hierarchy edits require READ COMMITTED isolation';
+    END IF;
+    PERFORM pg_advisory_xact_lock(74321, 2);
+    IF NEW.parent_survey_event_id = NEW.id OR EXISTS (
+      WITH RECURSIVE ancestors AS (
+        SELECT id, parent_survey_event_id FROM survey_events WHERE id = NEW.parent_survey_event_id
+        UNION
+        SELECT e.id, e.parent_survey_event_id FROM survey_events e
+          JOIN ancestors a ON e.id = a.parent_survey_event_id
+      ) SELECT FROM ancestors WHERE id = NEW.id
+    ) THEN RAISE EXCEPTION 'Survey event cycle'; END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_event_target(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_event_target() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE t survey_targets; version_id bigint;
+BEGIN
+  SELECT survey_protocol_version_id INTO version_id FROM survey_events WHERE id = NEW.survey_event_id;
+  SELECT * INTO t FROM survey_targets WHERE id = NEW.survey_target_id;
+  IF t.survey_protocol_version_id IS DISTINCT FROM version_id THEN
+    RAISE EXCEPTION 'Target must belong to the event protocol version';
+  END IF;
+  IF NEW.target_label_snapshot IS DISTINCT FROM t.label OR
+     NEW.target_scope_snapshot IS DISTINCT FROM jsonb_build_object('scope_type',t.scope_type,'scope_definition',t.scope_definition) OR
+     NEW.taxon_id_snapshot IS DISTINCT FROM t.taxon_id OR
+     NEW.taxon_name_snapshot IS DISTINCT FROM t.taxon_name_snapshot OR
+     NEW.external_taxon_uri_snapshot IS DISTINCT FROM t.external_taxon_uri THEN
+    RAISE EXCEPTION 'Event target snapshots must match the published definition';
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_measurement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_measurement() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE d survey_measurement_definitions; version_id bigint;
+BEGIN
+  SELECT * INTO d FROM survey_measurement_definitions WHERE id = NEW.survey_measurement_definition_id;
+  SELECT survey_protocol_version_id INTO version_id FROM survey_events WHERE id = NEW.survey_event_id;
+  IF d.survey_protocol_version_id IS DISTINCT FROM version_id THEN
+    RAISE EXCEPTION 'Measurement definition must belong to the event protocol';
+  END IF;
+  IF (d.applies_to = 'event' AND NEW.survey_detection_id IS NOT NULL) OR
+     (d.applies_to = 'detection' AND NEW.survey_detection_id IS NULL) THEN
+    RAISE EXCEPTION 'Measurement scope does not match the definition';
+  END IF;
+  IF NEW.unit IS DISTINCT FROM d.unit THEN RAISE EXCEPTION 'Measurement unit does not match the definition'; END IF;
+  IF (d.data_type = 'numeric' AND NEW.value_numeric IS NULL) OR
+     (d.data_type IN ('text','categorical') AND NEW.value_text IS NULL) OR
+     (d.data_type = 'boolean' AND NEW.value_boolean IS NULL) THEN
+    RAISE EXCEPTION 'Measurement value does not match declared type';
+  END IF;
+  IF d.data_type = 'categorical' AND NOT (d.allowed_values ? NEW.value_text) THEN
+    RAISE EXCEPTION 'Measurement category is outside its vocabulary';
+  END IF;
+  IF d.data_type = 'numeric' AND (NEW.value_numeric < (d.validation_rules->>'min')::numeric OR
+     NEW.value_numeric > (d.validation_rules->>'max')::numeric) THEN
+    RAISE EXCEPTION 'Measurement is outside its declared range';
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_observation_link(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_observation_link() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  IF TG_OP = 'UPDATE' THEN RAISE EXCEPTION 'Unlink and recreate observation links instead of rewriting them'; END IF;
+  UPDATE survey_events SET updated_at = clock_timestamp()
+    WHERE id = NEW.survey_event_id AND status NOT IN ('completed','void');
+  IF NOT FOUND THEN RAISE EXCEPTION 'Cannot attach evidence to a completed or void survey'; END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_protocol_child(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_protocol_child() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE parent_id bigint;
+BEGIN
+  parent_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.survey_protocol_version_id ELSE NEW.survey_protocol_version_id END;
+  IF TG_OP = 'UPDATE' AND NEW.survey_protocol_version_id <> OLD.survey_protocol_version_id THEN
+    RAISE EXCEPTION 'Move definitions by copying them into a new version';
+  END IF;
+  UPDATE survey_protocol_versions SET updated_at = clock_timestamp()
+    WHERE id = parent_id AND status = 'draft';
+  IF NOT FOUND THEN RAISE EXCEPTION 'Only draft survey definitions can be edited'; END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_protocol_version(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_protocol_version() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.published_at IS NOT NULL THEN RAISE EXCEPTION 'Published survey versions cannot be deleted'; END IF;
+    RETURN OLD;
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status <> 'draft' THEN RAISE EXCEPTION 'Create a draft before publication'; END IF;
+  ELSE
+    IF OLD.published_at IS NOT NULL THEN
+      IF (to_jsonb(NEW) - ARRAY['status','updated_at']) IS DISTINCT FROM
+         (to_jsonb(OLD) - ARRAY['status','updated_at']) OR
+         NOT (NEW.status = OLD.status OR (OLD.status = 'published' AND NEW.status = 'retired')) THEN
+        RAISE EXCEPTION 'Published survey definitions are immutable';
+      END IF;
+    ELSIF NEW.status <> OLD.status THEN
+      IF NEW.status <> 'published' OR NOT EXISTS (
+        SELECT FROM survey_targets WHERE survey_protocol_version_id = NEW.id) THEN
+        RAISE EXCEPTION 'Publication requires a draft with at least one target';
+      END IF;
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_stable_uuid(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_stable_uuid() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.uuid IS DISTINCT FROM OLD.uuid THEN RAISE EXCEPTION 'Survey UUID is stable'; END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_trip_type(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_trip_type() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.type IS DISTINCT FROM 'Trip' AND EXISTS (SELECT FROM survey_events WHERE trip_id = OLD.id) THEN
+    RAISE EXCEPTION 'A Post referenced by survey events must remain a Trip';
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_guard_unit_hierarchy(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_guard_unit_hierarchy() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.uuid IS DISTINCT FROM OLD.uuid THEN
+    RAISE EXCEPTION 'Sampling unit UUID is stable';
+  END IF;
+  IF TG_OP = 'INSERT' OR NEW.parent_survey_sampling_unit_id IS DISTINCT FROM OLD.parent_survey_sampling_unit_id
+    OR NEW.survey_site_id IS DISTINCT FROM OLD.survey_site_id THEN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'Survey hierarchy edits require READ COMMITTED isolation';
+    END IF;
+    PERFORM pg_advisory_xact_lock(74321, 1);
+    IF NEW.parent_survey_sampling_unit_id = NEW.id OR EXISTS (
+      WITH RECURSIVE ancestors AS (
+        SELECT id, parent_survey_sampling_unit_id FROM survey_sampling_units WHERE id = NEW.parent_survey_sampling_unit_id
+        UNION
+        SELECT u.id, u.parent_survey_sampling_unit_id FROM survey_sampling_units u
+          JOIN ancestors a ON u.id = a.parent_survey_sampling_unit_id
+      ) SELECT FROM ancestors WHERE id = NEW.id
+    ) THEN RAISE EXCEPTION 'Survey sampling unit cycle'; END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+--
+-- Name: survey_has_positive_effort(bigint); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_has_positive_effort(event_id bigint) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT EXISTS (SELECT FROM survey_efforts WHERE survey_event_id = event_id AND
+    (duration_seconds > 0 OR distance_meters > 0 OR area_square_meters > 0));
+$$;
+
+--
+-- Name: survey_valid_measurement_definition(text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_valid_measurement_definition(kind text, vals jsonb, rules jsonb) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+BEGIN
+  IF jsonb_typeof(vals) <> 'array' OR jsonb_typeof(rules) <> 'object' THEN RETURN false; END IF;
+  IF kind = 'categorical' THEN
+    IF jsonb_array_length(vals) = 0 OR EXISTS (
+      SELECT FROM jsonb_array_elements(vals) x WHERE jsonb_typeof(x) <> 'string' OR btrim(x #>> '{}') = '')
+      OR (SELECT count(*) <> count(DISTINCT x) FROM jsonb_array_elements(vals) x) THEN RETURN false;
+    END IF;
+  ELSIF vals <> '[]'::jsonb THEN RETURN false;
+  END IF;
+  IF kind <> 'numeric' THEN RETURN rules = '{}'::jsonb; END IF;
+  IF rules - ARRAY['min','max'] <> '{}'::jsonb THEN RETURN false; END IF;
+  IF (rules ? 'min' AND jsonb_typeof(rules->'min') <> 'number') OR
+     (rules ? 'max' AND jsonb_typeof(rules->'max') <> 'number') THEN RETURN false; END IF;
+  RETURN NOT (rules ?& ARRAY['min','max']) OR (rules->>'min')::numeric <= (rules->>'max')::numeric;
+END $$;
+
+--
+-- Name: survey_valid_protocol_definition(jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.survey_valid_protocol_definition(d jsonb) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+DECLARE k text; v jsonb;
+BEGIN
+  IF jsonb_typeof(d) <> 'object' THEN RETURN false; END IF;
+  FOR k, v IN SELECT * FROM jsonb_each(d) LOOP
+    IF k IN ('require_effort','allow_skipped_targets','allow_not_applicable_targets','allow_effort_outside_event') THEN
+      IF jsonb_typeof(v) <> 'boolean' THEN RETURN false; END IF;
+    ELSIF k IN ('allowed_methods','required_effort_fields') THEN
+      IF jsonb_typeof(v) <> 'array' OR jsonb_array_length(v) = 0 THEN RETURN false; END IF;
+      IF EXISTS (SELECT FROM jsonb_array_elements(v) x WHERE jsonb_typeof(x) <> 'string' OR btrim(x #>> '{}') = '') THEN
+        RETURN false;
+      END IF;
+      IF k = 'required_effort_fields' AND EXISTS (
+        SELECT FROM jsonb_array_elements_text(v) x WHERE x NOT IN
+          ('duration_seconds','distance_meters','area_square_meters','observer_count','replicate_number')) THEN RETURN false;
+      END IF;
+    ELSE RETURN false;
+    END IF;
+  END LOOP;
+  RETURN true;
+END $$;
+
+--
+-- Name: survey_detections; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_detections (
+    id bigint NOT NULL,
+    uuid uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    survey_event_id bigint NOT NULL,
+    survey_event_target_id bigint,
+    taxon_id integer,
+    taxon_name_snapshot text,
+    external_taxon_uri text,
+    occurrence_status character varying DEFAULT 'present'::character varying NOT NULL,
+    quantity numeric,
+    quantity_type text,
+    quantity_verbatim text,
+    recorded_at timestamp without time zone,
+    survey_effort_id bigint,
+    recorded_by_user_id integer,
+    remarks text,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_absence_quantity CHECK ((((occurrence_status)::text <> 'absent'::text) OR ((survey_event_target_id IS NOT NULL) AND ((quantity IS NULL) OR (quantity = (0)::numeric)) AND (quantity_verbatim IS NULL)))),
+    CONSTRAINT survey_detection_occurrence CHECK (((occurrence_status)::text = ANY ((ARRAY['present'::character varying, 'absent'::character varying])::text[]))),
+    CONSTRAINT survey_detection_quantity CHECK (((quantity >= (0)::numeric) AND (quantity <> 'NaN'::numeric))),
+    CONSTRAINT survey_detections_quantity_finite CHECK ((quantity <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])))
+);
+
+--
+-- Name: survey_detections_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_detections_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_detections_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_detections_id_seq OWNED BY public.survey_detections.id;
+
+--
+-- Name: survey_efforts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_efforts (
+    id bigint NOT NULL,
+    survey_event_id bigint NOT NULL,
+    method character varying NOT NULL,
+    started_at timestamp without time zone,
+    ended_at timestamp without time zone,
+    duration_seconds integer,
+    distance_meters numeric,
+    area_square_meters numeric,
+    observer_count integer,
+    replicate_number integer,
+    equipment jsonb DEFAULT '{}'::jsonb NOT NULL,
+    conditions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    remarks text,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_effort_configuration CHECK (((jsonb_typeof(equipment) = 'object'::text) AND (jsonb_typeof(conditions) = 'object'::text))),
+    CONSTRAINT survey_effort_method CHECK ((btrim((method)::text) <> ''::text)),
+    CONSTRAINT survey_effort_quantities CHECK (((duration_seconds >= 0) AND (distance_meters >= (0)::numeric) AND (distance_meters <> 'NaN'::numeric) AND (area_square_meters >= (0)::numeric) AND (area_square_meters <> 'NaN'::numeric) AND (observer_count > 0) AND (replicate_number > 0))),
+    CONSTRAINT survey_effort_times CHECK (((ended_at IS NULL) OR ((started_at IS NOT NULL) AND (ended_at >= started_at)))),
+    CONSTRAINT survey_efforts_area_square_meters_finite CHECK ((area_square_meters <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))),
+    CONSTRAINT survey_efforts_distance_meters_finite CHECK ((distance_meters <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])))
+);
+
+--
+-- Name: survey_efforts_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_efforts_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_efforts_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_efforts_id_seq OWNED BY public.survey_efforts.id;
+
+--
+-- Name: survey_event_participants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_event_participants (
+    id bigint NOT NULL,
+    survey_event_id bigint NOT NULL,
+    user_id integer,
+    participant_name text,
+    role character varying DEFAULT 'observer'::character varying NOT NULL,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_participant_identity CHECK (((user_id IS NOT NULL) OR (NULLIF(btrim(participant_name), ''::text) IS NOT NULL))),
+    CONSTRAINT survey_participant_role CHECK (((role)::text = ANY ((ARRAY['observer'::character varying, 'leader'::character varying, 'recorder'::character varying, 'validator'::character varying, 'other'::character varying])::text[])))
+);
+
+--
+-- Name: survey_event_participants_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_event_participants_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_event_participants_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_event_participants_id_seq OWNED BY public.survey_event_participants.id;
+
+--
+-- Name: survey_event_targets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_event_targets (
+    id bigint NOT NULL,
+    survey_event_id bigint NOT NULL,
+    survey_target_id bigint NOT NULL,
+    target_label_snapshot text NOT NULL,
+    target_scope_snapshot jsonb NOT NULL,
+    taxon_id_snapshot integer,
+    taxon_name_snapshot text,
+    external_taxon_uri_snapshot text,
+    status character varying DEFAULT 'not_assessed'::character varying NOT NULL,
+    coverage_complete boolean,
+    absence_reporting boolean,
+    remarks text,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_event_target_snapshot CHECK (((btrim(target_label_snapshot) <> ''::text) AND (jsonb_typeof(target_scope_snapshot) = 'object'::text))),
+    CONSTRAINT survey_event_target_status CHECK (((status)::text = ANY ((ARRAY['not_assessed'::character varying, 'surveyed'::character varying, 'skipped'::character varying, 'not_applicable'::character varying])::text[]))),
+    CONSTRAINT survey_target_absence_coverage CHECK (((absence_reporting IS NOT TRUE) OR (((status)::text = 'surveyed'::text) AND (coverage_complete IS TRUE))))
+);
+
+--
+-- Name: survey_event_targets_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_event_targets_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_event_targets_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_event_targets_id_seq OWNED BY public.survey_event_targets.id;
+
+--
+-- Name: survey_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_events_id_seq OWNED BY public.survey_events.id;
+
+--
+-- Name: survey_measurement_definitions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_measurement_definitions (
+    id bigint NOT NULL,
+    survey_protocol_version_id bigint NOT NULL,
+    field_key character varying NOT NULL,
+    label text NOT NULL,
+    description text,
+    data_type character varying NOT NULL,
+    unit character varying,
+    unit_uri text,
+    vocabulary_uri text,
+    allowed_values jsonb DEFAULT '[]'::jsonb NOT NULL,
+    validation_rules jsonb DEFAULT '{}'::jsonb NOT NULL,
+    applies_to character varying DEFAULT 'event'::character varying NOT NULL,
+    required boolean DEFAULT false NOT NULL,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_measurement_configuration CHECK (public.survey_valid_measurement_definition((data_type)::text, allowed_values, validation_rules)),
+    CONSTRAINT survey_measurement_definition_label CHECK ((((field_key)::text ~ '^[a-z][a-z0-9_]*$'::text) AND (btrim(label) <> ''::text))),
+    CONSTRAINT survey_measurement_definition_type CHECK ((((data_type)::text = ANY ((ARRAY['numeric'::character varying, 'text'::character varying, 'boolean'::character varying, 'categorical'::character varying])::text[])) AND ((applies_to)::text = ANY ((ARRAY['event'::character varying, 'detection'::character varying])::text[]))))
+);
+
+--
+-- Name: survey_measurement_definitions_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_measurement_definitions_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_measurement_definitions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_measurement_definitions_id_seq OWNED BY public.survey_measurement_definitions.id;
+
+--
+-- Name: survey_measurements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_measurements (
+    id bigint NOT NULL,
+    survey_event_id bigint NOT NULL,
+    survey_detection_id bigint,
+    survey_measurement_definition_id bigint NOT NULL,
+    value_numeric numeric,
+    value_text text,
+    value_boolean boolean,
+    unit character varying,
+    recorded_at timestamp without time zone,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_measurement_one_value CHECK (((num_nonnulls(value_numeric, value_text, value_boolean) = 1) AND ((value_numeric IS NULL) OR (value_numeric <> 'NaN'::numeric)))),
+    CONSTRAINT survey_measurements_value_numeric_finite CHECK ((value_numeric <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])))
+);
+
+--
+-- Name: survey_measurements_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_measurements_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_measurements_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_measurements_id_seq OWNED BY public.survey_measurements.id;
+
+--
+-- Name: survey_observations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_observations (
+    id bigint NOT NULL,
+    survey_event_id bigint NOT NULL,
+    observation_id integer NOT NULL,
+    survey_detection_id bigint,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL
+);
+
+--
+-- Name: survey_observations_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_observations_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_observations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_observations_id_seq OWNED BY public.survey_observations.id;
+
+--
+-- Name: survey_protocol_versions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_protocol_versions (
+    id bigint NOT NULL,
+    survey_protocol_id bigint NOT NULL,
+    version_number integer NOT NULL,
+    instructions text,
+    definition jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status character varying DEFAULT 'draft'::character varying NOT NULL,
+    published_at timestamp without time zone,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_protocol_configuration CHECK (public.survey_valid_protocol_definition(definition)),
+    CONSTRAINT survey_version_lifecycle CHECK (((((status)::text = 'draft'::text) AND (published_at IS NULL)) OR (((status)::text = ANY ((ARRAY['published'::character varying, 'retired'::character varying])::text[])) AND (published_at IS NOT NULL)))),
+    CONSTRAINT survey_version_positive CHECK ((version_number > 0))
+);
+
+--
+-- Name: survey_protocol_versions_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_protocol_versions_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_protocol_versions_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_protocol_versions_id_seq OWNED BY public.survey_protocol_versions.id;
+
+--
+-- Name: survey_protocols; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_protocols (
+    id bigint NOT NULL,
+    uuid uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id integer NOT NULL,
+    title text NOT NULL,
+    description text,
+    status character varying DEFAULT 'draft'::character varying NOT NULL,
+    license character varying,
+    source_url text,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_protocol_status CHECK (((status)::text = ANY ((ARRAY['draft'::character varying, 'active'::character varying, 'archived'::character varying])::text[]))),
+    CONSTRAINT survey_protocol_title CHECK ((btrim(title) <> ''::text))
+);
+
+--
+-- Name: survey_protocols_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_protocols_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_protocols_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_protocols_id_seq OWNED BY public.survey_protocols.id;
+
+--
+-- Name: survey_sampling_units; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_sampling_units (
+    id bigint NOT NULL,
+    uuid uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    survey_site_id bigint NOT NULL,
+    parent_survey_sampling_unit_id bigint,
+    code character varying NOT NULL,
+    name text,
+    unit_type character varying NOT NULL,
+    description text,
+    geom public.geometry(Geometry,4326),
+    area_square_meters numeric,
+    length_meters numeric,
+    status character varying DEFAULT 'active'::character varying NOT NULL,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_sampling_units_area_square_meters_finite CHECK ((area_square_meters <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))),
+    CONSTRAINT survey_sampling_units_geometry CHECK (((geom IS NULL) OR ((public.st_srid(geom) = 4326) AND public.st_isvalid(geom) AND (NOT public.st_isempty(geom)) AND (public.geometrytype(geom) = ANY (ARRAY['POINT'::text, 'LINESTRING'::text, 'POLYGON'::text, 'MULTIPOINT'::text, 'MULTILINESTRING'::text, 'MULTIPOLYGON'::text])) AND (public.st_xmin(public.box3d(geom)) >= ('-180'::integer)::double precision) AND (public.st_xmax(public.box3d(geom)) <= (180)::double precision) AND (public.st_ymin(public.box3d(geom)) >= ('-90'::integer)::double precision) AND (public.st_ymax(public.box3d(geom)) <= (90)::double precision)))),
+    CONSTRAINT survey_sampling_units_length_meters_finite CHECK ((length_meters <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))),
+    CONSTRAINT survey_unit_code CHECK ((btrim((code)::text) <> ''::text)),
+    CONSTRAINT survey_unit_dimensions CHECK (((area_square_meters >= (0)::numeric) AND (area_square_meters <> 'NaN'::numeric) AND ((length_meters >= (0)::numeric) AND (length_meters <> 'NaN'::numeric)))),
+    CONSTRAINT survey_unit_type_status CHECK ((((unit_type)::text = ANY ((ARRAY['point'::character varying, 'plot'::character varying, 'transect'::character varying, 'quadrat'::character varying, 'grid_cell'::character varying, 'route'::character varying, 'other'::character varying])::text[])) AND ((status)::text = ANY ((ARRAY['active'::character varying, 'retired'::character varying])::text[]))))
+);
+
+--
+-- Name: survey_sampling_units_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_sampling_units_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_sampling_units_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_sampling_units_id_seq OWNED BY public.survey_sampling_units.id;
+
+--
+-- Name: survey_sites; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_sites (
+    id bigint NOT NULL,
+    uuid uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    name text NOT NULL,
+    description text,
+    place_id integer,
+    created_by_user_id integer NOT NULL,
+    geom public.geometry(Geometry,4326),
+    location_privacy character varying DEFAULT 'private'::character varying NOT NULL,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_site_name CHECK ((btrim(name) <> ''::text)),
+    CONSTRAINT survey_site_privacy CHECK (((location_privacy)::text = ANY ((ARRAY['public'::character varying, 'restricted'::character varying, 'private'::character varying])::text[]))),
+    CONSTRAINT survey_sites_geometry CHECK (((geom IS NULL) OR ((public.st_srid(geom) = 4326) AND public.st_isvalid(geom) AND (NOT public.st_isempty(geom)) AND (public.geometrytype(geom) = ANY (ARRAY['POINT'::text, 'LINESTRING'::text, 'POLYGON'::text, 'MULTIPOINT'::text, 'MULTILINESTRING'::text, 'MULTIPOLYGON'::text])) AND (public.st_xmin(public.box3d(geom)) >= ('-180'::integer)::double precision) AND (public.st_xmax(public.box3d(geom)) <= (180)::double precision) AND (public.st_ymin(public.box3d(geom)) >= ('-90'::integer)::double precision) AND (public.st_ymax(public.box3d(geom)) <= (90)::double precision))))
+);
+
+--
+-- Name: survey_sites_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_sites_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_sites_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_sites_id_seq OWNED BY public.survey_sites.id;
+
+--
+-- Name: survey_targets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_targets (
+    id bigint NOT NULL,
+    survey_protocol_version_id bigint NOT NULL,
+    taxon_id integer,
+    label text NOT NULL,
+    scope_type character varying NOT NULL,
+    scope_definition jsonb DEFAULT '{}'::jsonb NOT NULL,
+    taxon_name_snapshot text,
+    external_taxon_uri text,
+    required boolean DEFAULT false NOT NULL,
+    "position" integer,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL,
+    CONSTRAINT survey_target_label CHECK ((btrim(label) <> ''::text)),
+    CONSTRAINT survey_target_position CHECK ((("position" IS NULL) OR ("position" >= 0))),
+    CONSTRAINT survey_target_scope CHECK (((jsonb_typeof(scope_definition) = 'object'::text) AND ((((scope_type)::text = 'taxon'::text) AND (taxon_id IS NOT NULL) AND (NULLIF(btrim(taxon_name_snapshot), ''::text) IS NOT NULL) AND (scope_definition = '{}'::jsonb)) OR (((scope_type)::text = ANY ((ARRAY['taxon_group'::character varying, 'verbatim'::character varying])::text[])) AND (jsonb_typeof((scope_definition -> 'description'::text)) = 'string'::text) AND (NULLIF(btrim((scope_definition ->> 'description'::text)), ''::text) IS NOT NULL) AND ((scope_definition - 'description'::text) = '{}'::jsonb) AND (((scope_type)::text <> 'verbatim'::text) OR (taxon_id IS NULL))))))
+);
+
+--
+-- Name: survey_targets_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.survey_targets_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+--
+-- Name: survey_targets_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.survey_targets_id_seq OWNED BY public.survey_targets.id;
+
+--
+-- Name: survey_detections id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_detections ALTER COLUMN id SET DEFAULT nextval('public.survey_detections_id_seq'::regclass);
+
+--
+-- Name: survey_efforts id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_efforts ALTER COLUMN id SET DEFAULT nextval('public.survey_efforts_id_seq'::regclass);
+
+--
+-- Name: survey_event_participants id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_participants ALTER COLUMN id SET DEFAULT nextval('public.survey_event_participants_id_seq'::regclass);
+
+--
+-- Name: survey_event_targets id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_targets ALTER COLUMN id SET DEFAULT nextval('public.survey_event_targets_id_seq'::regclass);
+
+--
+-- Name: survey_events id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events ALTER COLUMN id SET DEFAULT nextval('public.survey_events_id_seq'::regclass);
+
+--
+-- Name: survey_measurement_definitions id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurement_definitions ALTER COLUMN id SET DEFAULT nextval('public.survey_measurement_definitions_id_seq'::regclass);
+
+--
+-- Name: survey_measurements id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurements ALTER COLUMN id SET DEFAULT nextval('public.survey_measurements_id_seq'::regclass);
+
+--
+-- Name: survey_observations id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_observations ALTER COLUMN id SET DEFAULT nextval('public.survey_observations_id_seq'::regclass);
+
+--
+-- Name: survey_protocol_versions id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_protocol_versions ALTER COLUMN id SET DEFAULT nextval('public.survey_protocol_versions_id_seq'::regclass);
+
+--
+-- Name: survey_protocols id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_protocols ALTER COLUMN id SET DEFAULT nextval('public.survey_protocols_id_seq'::regclass);
+
+--
+-- Name: survey_sampling_units id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sampling_units ALTER COLUMN id SET DEFAULT nextval('public.survey_sampling_units_id_seq'::regclass);
+
+--
+-- Name: survey_sites id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sites ALTER COLUMN id SET DEFAULT nextval('public.survey_sites_id_seq'::regclass);
+
+--
+-- Name: survey_targets id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_targets ALTER COLUMN id SET DEFAULT nextval('public.survey_targets_id_seq'::regclass);
+
+--
+-- Name: survey_detections survey_detections_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_detections
+    ADD CONSTRAINT survey_detections_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_efforts survey_efforts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_efforts
+    ADD CONSTRAINT survey_efforts_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_event_participants survey_event_participants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_participants
+    ADD CONSTRAINT survey_event_participants_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_event_targets survey_event_targets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_targets
+    ADD CONSTRAINT survey_event_targets_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_events survey_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events
+    ADD CONSTRAINT survey_events_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_measurement_definitions survey_measurement_definitions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurement_definitions
+    ADD CONSTRAINT survey_measurement_definitions_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_measurements survey_measurements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurements
+    ADD CONSTRAINT survey_measurements_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_observations survey_observations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_observations
+    ADD CONSTRAINT survey_observations_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_protocol_versions survey_protocol_versions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_protocol_versions
+    ADD CONSTRAINT survey_protocol_versions_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_protocols survey_protocols_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_protocols
+    ADD CONSTRAINT survey_protocols_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_sampling_units survey_sampling_units_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sampling_units
+    ADD CONSTRAINT survey_sampling_units_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_sites survey_sites_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sites
+    ADD CONSTRAINT survey_sites_pkey PRIMARY KEY (id);
+
+--
+-- Name: survey_targets survey_targets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_targets
+    ADD CONSTRAINT survey_targets_pkey PRIMARY KEY (id);
+
+--
+-- Name: index_survey_detections_on_recorded_by_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_detections_on_recorded_by_user_id ON public.survey_detections USING btree (recorded_by_user_id);
+
+--
+-- Name: index_survey_detections_on_survey_effort_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_detections_on_survey_effort_id ON public.survey_detections USING btree (survey_effort_id);
+
+--
+-- Name: index_survey_detections_on_taxon_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_detections_on_taxon_id ON public.survey_detections USING btree (taxon_id);
+
+--
+-- Name: index_survey_detections_on_uuid; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_survey_detections_on_uuid ON public.survey_detections USING btree (uuid);
+
+--
+-- Name: index_survey_efforts_on_survey_event_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_efforts_on_survey_event_id ON public.survey_efforts USING btree (survey_event_id);
+
+--
+-- Name: index_survey_event_participants_on_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_event_participants_on_user_id ON public.survey_event_participants USING btree (user_id);
+
+--
+-- Name: index_survey_event_targets_on_survey_target_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_event_targets_on_survey_target_id ON public.survey_event_targets USING btree (survey_target_id);
+
+--
+-- Name: index_survey_event_targets_on_taxon_id_snapshot; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_event_targets_on_taxon_id_snapshot ON public.survey_event_targets USING btree (taxon_id_snapshot);
+
+--
+-- Name: index_survey_events_on_geom; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_events_on_geom ON public.survey_events USING gist (geom);
+
+--
+-- Name: index_survey_events_on_parent_survey_event_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_events_on_parent_survey_event_id ON public.survey_events USING btree (parent_survey_event_id);
+
+--
+-- Name: index_survey_events_on_survey_protocol_version_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_events_on_survey_protocol_version_id ON public.survey_events USING btree (survey_protocol_version_id);
+
+--
+-- Name: index_survey_events_on_survey_site_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_events_on_survey_site_id ON public.survey_events USING btree (survey_site_id);
+
+--
+-- Name: index_survey_events_on_trip_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_events_on_trip_id ON public.survey_events USING btree (trip_id);
+
+--
+-- Name: index_survey_events_on_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_events_on_user_id ON public.survey_events USING btree (user_id);
+
+--
+-- Name: index_survey_events_on_uuid; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_survey_events_on_uuid ON public.survey_events USING btree (uuid);
+
+--
+-- Name: index_survey_measurements_on_survey_detection_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_measurements_on_survey_detection_id ON public.survey_measurements USING btree (survey_detection_id);
+
+--
+-- Name: index_survey_observations_on_observation_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_observations_on_observation_id ON public.survey_observations USING btree (observation_id);
+
+--
+-- Name: index_survey_observations_on_survey_detection_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_observations_on_survey_detection_id ON public.survey_observations USING btree (survey_detection_id);
+
+--
+-- Name: index_survey_protocols_on_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_protocols_on_user_id ON public.survey_protocols USING btree (user_id);
+
+--
+-- Name: index_survey_protocols_on_uuid; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_survey_protocols_on_uuid ON public.survey_protocols USING btree (uuid);
+
+--
+-- Name: index_survey_sampling_units_on_geom; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_sampling_units_on_geom ON public.survey_sampling_units USING gist (geom);
+
+--
+-- Name: index_survey_sampling_units_on_uuid; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_survey_sampling_units_on_uuid ON public.survey_sampling_units USING btree (uuid);
+
+--
+-- Name: index_survey_sites_on_created_by_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_sites_on_created_by_user_id ON public.survey_sites USING btree (created_by_user_id);
+
+--
+-- Name: index_survey_sites_on_geom; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_sites_on_geom ON public.survey_sites USING gist (geom);
+
+--
+-- Name: index_survey_sites_on_place_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_sites_on_place_id ON public.survey_sites USING btree (place_id);
+
+--
+-- Name: index_survey_sites_on_uuid; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_survey_sites_on_uuid ON public.survey_sites USING btree (uuid);
+
+--
+-- Name: index_survey_targets_on_taxon_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX index_survey_targets_on_taxon_id ON public.survey_targets USING btree (taxon_id);
+
+--
+-- Name: survey_detection_event_pair; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_detection_event_pair ON public.survey_detections USING btree (id, survey_event_id);
+
+--
+-- Name: survey_detections_event_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX survey_detections_event_target ON public.survey_detections USING btree (survey_event_id, survey_event_target_id);
+
+--
+-- Name: survey_detections_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX survey_detections_target ON public.survey_detections USING btree (survey_event_target_id);
+
+--
+-- Name: survey_effort_event_pair; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_effort_event_pair ON public.survey_efforts USING btree (id, survey_event_id);
+
+--
+-- Name: survey_event_target_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_event_target_unique ON public.survey_event_targets USING btree (survey_event_id, survey_target_id);
+
+--
+-- Name: survey_measurement_field_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_measurement_field_unique ON public.survey_measurement_definitions USING btree (survey_protocol_version_id, field_key);
+
+--
+-- Name: survey_measurements_definition; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX survey_measurements_definition ON public.survey_measurements USING btree (survey_measurement_definition_id);
+
+--
+-- Name: survey_measurements_event_definition; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX survey_measurements_event_definition ON public.survey_measurements USING btree (survey_event_id, survey_measurement_definition_id);
+
+--
+-- Name: survey_observation_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_observation_unique ON public.survey_observations USING btree (survey_event_id, observation_id);
+
+--
+-- Name: survey_registered_participant_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_registered_participant_unique ON public.survey_event_participants USING btree (survey_event_id, user_id);
+
+--
+-- Name: survey_target_event_pair; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_target_event_pair ON public.survey_event_targets USING btree (id, survey_event_id);
+
+--
+-- Name: survey_target_position_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_target_position_unique ON public.survey_targets USING btree (survey_protocol_version_id, "position");
+
+--
+-- Name: survey_unit_code_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_unit_code_unique ON public.survey_sampling_units USING btree (survey_site_id, code);
+
+--
+-- Name: survey_unit_history; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX survey_unit_history ON public.survey_events USING btree (survey_sampling_unit_id, started_at);
+
+--
+-- Name: survey_unit_parent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX survey_unit_parent ON public.survey_sampling_units USING btree (parent_survey_sampling_unit_id);
+
+--
+-- Name: survey_unit_site_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_unit_site_unique ON public.survey_sampling_units USING btree (id, survey_site_id);
+
+--
+-- Name: survey_version_number_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX survey_version_number_unique ON public.survey_protocol_versions USING btree (survey_protocol_id, version_number);
+
+--
+-- Name: survey_detections survey_detection_00_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_detection_00_lock BEFORE INSERT OR DELETE OR UPDATE ON public.survey_detections FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event_child();
+
+--
+-- Name: survey_detections survey_detection_semantics_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_detection_semantics_guard BEFORE INSERT OR UPDATE ON public.survey_detections FOR EACH ROW EXECUTE FUNCTION public.survey_guard_detection();
+
+--
+-- Name: survey_efforts survey_effort_00_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_effort_00_lock BEFORE INSERT OR DELETE OR UPDATE ON public.survey_efforts FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event_child();
+
+--
+-- Name: survey_efforts survey_effort_absence_context; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_effort_absence_context AFTER INSERT OR DELETE OR UPDATE ON public.survey_efforts FOR EACH ROW EXECUTE FUNCTION public.survey_check_absence_context();
+
+--
+-- Name: survey_efforts survey_effort_timing_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_effort_timing_guard BEFORE INSERT OR UPDATE ON public.survey_efforts FOR EACH ROW EXECUTE FUNCTION public.survey_guard_effort();
+
+--
+-- Name: survey_events survey_event_10_completion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_event_10_completion BEFORE UPDATE ON public.survey_events FOR EACH ROW EXECUTE FUNCTION public.survey_enforce_event_completion();
+
+--
+-- Name: survey_events survey_event_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_event_guard BEFORE INSERT OR DELETE OR UPDATE ON public.survey_events FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event();
+
+--
+-- Name: survey_events survey_event_hierarchy_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_event_hierarchy_guard BEFORE INSERT OR UPDATE ON public.survey_events FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event_hierarchy();
+
+--
+-- Name: survey_event_targets survey_event_target_00_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_event_target_00_lock BEFORE INSERT OR DELETE OR UPDATE ON public.survey_event_targets FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event_child();
+
+--
+-- Name: survey_event_targets survey_event_target_snapshot_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_event_target_snapshot_guard BEFORE INSERT OR UPDATE ON public.survey_event_targets FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event_target();
+
+--
+-- Name: survey_measurements survey_measurement_00_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_measurement_00_lock BEFORE INSERT OR DELETE OR UPDATE ON public.survey_measurements FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event_child();
+
+--
+-- Name: survey_measurement_definitions survey_measurement_definition_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_measurement_definition_guard BEFORE INSERT OR DELETE OR UPDATE ON public.survey_measurement_definitions FOR EACH ROW EXECUTE FUNCTION public.survey_guard_protocol_child();
+
+--
+-- Name: survey_measurements survey_measurement_semantics_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_measurement_semantics_guard BEFORE INSERT OR UPDATE ON public.survey_measurements FOR EACH ROW EXECUTE FUNCTION public.survey_guard_measurement();
+
+--
+-- Name: survey_observations survey_observation_link_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_observation_link_guard BEFORE INSERT OR DELETE OR UPDATE ON public.survey_observations FOR EACH ROW EXECUTE FUNCTION public.survey_guard_observation_link();
+
+--
+-- Name: survey_event_participants survey_participant_00_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_participant_00_lock BEFORE INSERT OR DELETE OR UPDATE ON public.survey_event_participants FOR EACH ROW EXECUTE FUNCTION public.survey_guard_event_child();
+
+--
+-- Name: survey_protocols survey_protocol_uuid_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_protocol_uuid_guard BEFORE UPDATE ON public.survey_protocols FOR EACH ROW EXECUTE FUNCTION public.survey_guard_stable_uuid();
+
+--
+-- Name: survey_protocol_versions survey_protocol_version_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_protocol_version_guard BEFORE INSERT OR DELETE OR UPDATE ON public.survey_protocol_versions FOR EACH ROW EXECUTE FUNCTION public.survey_guard_protocol_version();
+
+--
+-- Name: survey_sites survey_site_uuid_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_site_uuid_guard BEFORE UPDATE ON public.survey_sites FOR EACH ROW EXECUTE FUNCTION public.survey_guard_stable_uuid();
+
+--
+-- Name: survey_event_targets survey_target_absence_context; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_target_absence_context AFTER INSERT OR DELETE OR UPDATE ON public.survey_event_targets FOR EACH ROW EXECUTE FUNCTION public.survey_check_absence_context();
+
+--
+-- Name: survey_targets survey_target_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_target_guard BEFORE INSERT OR DELETE OR UPDATE ON public.survey_targets FOR EACH ROW EXECUTE FUNCTION public.survey_guard_protocol_child();
+
+--
+-- Name: posts survey_trip_type_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_trip_type_guard BEFORE UPDATE OF type ON public.posts FOR EACH ROW EXECUTE FUNCTION public.survey_guard_trip_type();
+
+--
+-- Name: survey_sampling_units survey_unit_hierarchy_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_unit_hierarchy_guard BEFORE INSERT OR UPDATE ON public.survey_sampling_units FOR EACH ROW EXECUTE FUNCTION public.survey_guard_unit_hierarchy();
+
+--
+-- Name: survey_sampling_units survey_used_unit_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER survey_used_unit_guard BEFORE UPDATE ON public.survey_sampling_units FOR EACH ROW EXECUTE FUNCTION public.survey_freeze_used_unit();
+
+--
+-- Name: survey_measurements fk_rails_29eb7f4310; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurements
+    ADD CONSTRAINT fk_rails_29eb7f4310 FOREIGN KEY (survey_event_id) REFERENCES public.survey_events(id);
+
+--
+-- Name: survey_protocols fk_rails_2a218647df; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_protocols
+    ADD CONSTRAINT fk_rails_2a218647df FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+--
+-- Name: survey_event_targets fk_rails_36dce96474; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_targets
+    ADD CONSTRAINT fk_rails_36dce96474 FOREIGN KEY (survey_target_id) REFERENCES public.survey_targets(id);
+
+--
+-- Name: survey_measurements fk_rails_393cc877ab; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurements
+    ADD CONSTRAINT fk_rails_393cc877ab FOREIGN KEY (survey_measurement_definition_id) REFERENCES public.survey_measurement_definitions(id);
+
+--
+-- Name: survey_event_targets fk_rails_4e6eb5905f; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_targets
+    ADD CONSTRAINT fk_rails_4e6eb5905f FOREIGN KEY (taxon_id_snapshot) REFERENCES public.taxa(id);
+
+--
+-- Name: survey_event_participants fk_rails_5329e07395; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_participants
+    ADD CONSTRAINT fk_rails_5329e07395 FOREIGN KEY (survey_event_id) REFERENCES public.survey_events(id);
+
+--
+-- Name: survey_observations fk_rails_5d21ef45fe; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_observations
+    ADD CONSTRAINT fk_rails_5d21ef45fe FOREIGN KEY (survey_event_id) REFERENCES public.survey_events(id);
+
+--
+-- Name: survey_sampling_units fk_rails_61b4685217; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sampling_units
+    ADD CONSTRAINT fk_rails_61b4685217 FOREIGN KEY (survey_site_id) REFERENCES public.survey_sites(id);
+
+--
+-- Name: survey_observations fk_rails_65d364525a; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_observations
+    ADD CONSTRAINT fk_rails_65d364525a FOREIGN KEY (observation_id) REFERENCES public.observations(id) ON DELETE CASCADE;
+
+--
+-- Name: survey_events fk_rails_6c8ed61e56; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events
+    ADD CONSTRAINT fk_rails_6c8ed61e56 FOREIGN KEY (parent_survey_event_id) REFERENCES public.survey_events(id);
+
+--
+-- Name: survey_detections fk_rails_7224a1253b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_detections
+    ADD CONSTRAINT fk_rails_7224a1253b FOREIGN KEY (recorded_by_user_id) REFERENCES public.users(id);
+
+--
+-- Name: survey_events fk_rails_75bf0cd9d7; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events
+    ADD CONSTRAINT fk_rails_75bf0cd9d7 FOREIGN KEY (trip_id) REFERENCES public.posts(id) ON DELETE SET NULL;
+
+--
+-- Name: survey_events fk_rails_7768b9934f; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events
+    ADD CONSTRAINT fk_rails_7768b9934f FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+--
+-- Name: survey_sites fk_rails_7a7c2ede7b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sites
+    ADD CONSTRAINT fk_rails_7a7c2ede7b FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+--
+-- Name: survey_targets fk_rails_8868712d6b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_targets
+    ADD CONSTRAINT fk_rails_8868712d6b FOREIGN KEY (survey_protocol_version_id) REFERENCES public.survey_protocol_versions(id);
+
+--
+-- Name: survey_events fk_rails_9568fd9141; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events
+    ADD CONSTRAINT fk_rails_9568fd9141 FOREIGN KEY (survey_protocol_version_id) REFERENCES public.survey_protocol_versions(id);
+
+--
+-- Name: survey_detections fk_rails_b03f1f15c9; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_detections
+    ADD CONSTRAINT fk_rails_b03f1f15c9 FOREIGN KEY (survey_event_id) REFERENCES public.survey_events(id);
+
+--
+-- Name: survey_detections fk_rails_b5b6ff82bd; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_detections
+    ADD CONSTRAINT fk_rails_b5b6ff82bd FOREIGN KEY (taxon_id) REFERENCES public.taxa(id);
+
+--
+-- Name: survey_event_targets fk_rails_ba8cf87fff; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_targets
+    ADD CONSTRAINT fk_rails_ba8cf87fff FOREIGN KEY (survey_event_id) REFERENCES public.survey_events(id);
+
+--
+-- Name: survey_efforts fk_rails_c369f4d1df; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_efforts
+    ADD CONSTRAINT fk_rails_c369f4d1df FOREIGN KEY (survey_event_id) REFERENCES public.survey_events(id);
+
+--
+-- Name: survey_protocol_versions fk_rails_cb43e2b324; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_protocol_versions
+    ADD CONSTRAINT fk_rails_cb43e2b324 FOREIGN KEY (survey_protocol_id) REFERENCES public.survey_protocols(id);
+
+--
+-- Name: survey_events fk_rails_cc28619ca6; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events
+    ADD CONSTRAINT fk_rails_cc28619ca6 FOREIGN KEY (survey_site_id) REFERENCES public.survey_sites(id);
+
+--
+-- Name: survey_sites fk_rails_e44305c018; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sites
+    ADD CONSTRAINT fk_rails_e44305c018 FOREIGN KEY (place_id) REFERENCES public.places(id);
+
+--
+-- Name: survey_event_participants fk_rails_f06f107e64; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_event_participants
+    ADD CONSTRAINT fk_rails_f06f107e64 FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+--
+-- Name: survey_targets fk_rails_f4e7fafb6e; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_targets
+    ADD CONSTRAINT fk_rails_f4e7fafb6e FOREIGN KEY (taxon_id) REFERENCES public.taxa(id);
+
+--
+-- Name: survey_measurement_definitions fk_rails_f71421d179; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurement_definitions
+    ADD CONSTRAINT fk_rails_f71421d179 FOREIGN KEY (survey_protocol_version_id) REFERENCES public.survey_protocol_versions(id);
+
+--
+-- Name: survey_detections survey_detection_effort_event_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_detections
+    ADD CONSTRAINT survey_detection_effort_event_fk FOREIGN KEY (survey_effort_id, survey_event_id) REFERENCES public.survey_efforts(id, survey_event_id);
+
+--
+-- Name: survey_detections survey_detection_target_event_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_detections
+    ADD CONSTRAINT survey_detection_target_event_fk FOREIGN KEY (survey_event_target_id, survey_event_id) REFERENCES public.survey_event_targets(id, survey_event_id);
+
+--
+-- Name: survey_events survey_event_unit_site_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_events
+    ADD CONSTRAINT survey_event_unit_site_fk FOREIGN KEY (survey_sampling_unit_id, survey_site_id) REFERENCES public.survey_sampling_units(id, survey_site_id);
+
+--
+-- Name: survey_measurements survey_measurement_detection_event_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_measurements
+    ADD CONSTRAINT survey_measurement_detection_event_fk FOREIGN KEY (survey_detection_id, survey_event_id) REFERENCES public.survey_detections(id, survey_event_id);
+
+--
+-- Name: survey_observations survey_observation_detection_event_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_observations
+    ADD CONSTRAINT survey_observation_detection_event_fk FOREIGN KEY (survey_detection_id, survey_event_id) REFERENCES public.survey_detections(id, survey_event_id);
+
+--
+-- Name: survey_sampling_units survey_unit_parent_site_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_sampling_units
+    ADD CONSTRAINT survey_unit_parent_site_fk FOREIGN KEY (parent_survey_sampling_unit_id, survey_site_id) REFERENCES public.survey_sampling_units(id, survey_site_id);
+
+
+--
+
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20261015000005'),
+('20261015000004'),
+('20261015000003'),
+('20261015000002'),
+('20261015000001'),
+
 ('20090820033338'),
 ('20090920043428'),
 ('20091005055004'),
