@@ -2,6 +2,7 @@ class Trip < Post
   has_many :trip_taxa, :dependent => :destroy, :inverse_of => :trip
   has_many :trip_purposes, :dependent => :destroy
   has_many :taxa, :through => :trip_taxa
+  has_many :survey_events, foreign_key: :trip_id, inverse_of: :trip, dependent: :nullify
   belongs_to :place, :inverse_of => :trips
   accepts_nested_attributes_for :trip_purposes, :allow_destroy => true
   accepts_nested_attributes_for :trip_taxa, :allow_destroy => true
@@ -33,6 +34,12 @@ class Trip < Post
     scope = Observation.by(user).between_dates(start_time, stop_time)
     scope = scope.in_place(place_id) unless place_id.blank?
     scope
+  end
+
+  def structured_survey_observations
+    Observation.where( id: SurveyObservation.where(
+      survey_event_id: survey_events.select( :id )
+    ).select( :observation_id ) )
   end
 
   def add_taxa_from_observations
